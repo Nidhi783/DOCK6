@@ -1,0 +1,463 @@
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(grid)
+
+# ============================================================
+# 1M17 POSITIVE + NEGATIVE CONTROL
+# AUTOMATED DATA EXTRACTION + FINAL SIX-PANEL FIGURE
+# A B / C D / E F on one page
+# ============================================================
+
+# Edit these two paths if needed.
+BASE_DIR <- "/mnt/data/nidhi/R/1M17"
+
+POS_DIR <- "/mnt/data/nidhi/R/1M17/positive_control_sphere"
+NEG_SEARCH_ROOT <- BASE_DIR
+
+# Locate the prepared AQ4 reference automatically.
+# Multiple copies may exist in the 1M17 folder. If they are identical,
+# the script safely uses the first copy. If they differ, it stops and
+# asks you to inspect them rather than choosing arbitrarily.
+
+aq4_candidates <- list.files(
+  BASE_DIR,
+  pattern = "^AQ4_prepared\\.mol2$",
+  recursive = TRUE,
+  full.names = TRUE
+)
+
+if (length(aq4_candidates) == 0) {
+  stop("No AQ4_prepared.mol2 file was found anywhere under: ", BASE_DIR)
+}
+
+if (length(aq4_candidates) == 1) {
+  AQ4_REFERENCE <- aq4_candidates[1]
+} else {
+
+  aq4_md5 <- tools::md5sum(aq4_candidates)
+
+  if (length(unique(unname(aq4_md5))) == 1) {
+    AQ4_REFERENCE <- aq4_candidates[1]
+    message(
+      "Multiple identical AQ4_prepared.mol2 files found. Using: ",
+      AQ4_REFERENCE
+    )
+  } else {
+
+    preferred <- aq4_candidates[
+      grepl(
+        "positiv.*control.*sphere|positive.*control.*sphere",
+        aq4_candidates,
+        ignore.case = TRUE
+      )
+    ]
+
+    if (length(preferred) == 1) {
+      AQ4_REFERENCE <- preferred[1]
+      warning(
+        "AQ4_prepared.mol2 copies are not all identical. ",
+        "Using the positive-control copy: ",
+        AQ4_REFERENCE
+      )
+    } else {
+      stop(
+        "Multiple non-identical AQ4_prepared.mol2 files were found.\n",
+        paste(aq4_candidates, collapse = "\n")
+      )
+    }
+  }
+}
+
+message("AQ4 reference file: ", AQ4_REFERENCE)
+
+if (!dir.exists(BASE_DIR)) {
+  stop("1M17 base directory not found: ", BASE_DIR)
+}
+
+if (!dir.exists(POS_DIR)) {
+  stop("1M17 positive-control directory not found: ", POS_DIR)
+}
+
+
+positive_radii <- seq(4, 28, 2)
+negative_radii <- seq(8, 28, 2)  # 4 and 6 did not generate valid analysed poses
+
+# ============================================================
+# CONTROL-SPECIFIC SCORED-FILE FINDERS
+# ============================================================
+
+find_positive_scored_file <- function(r) {
+
+  exact_name <- paste0(
+    "AQ4_docked_radius", r, "_scored.mol2"
+  )
+
+  expected_file <- file.path(
+    POS_DIR,
+    paste0("radius", r, "_full"),
+    exact_name
+  )
+
+  if (file.exists(expected_file)) {
+    return(expected_file)
+  }
+
+  hits <- list.files(
+    POS_DIR,
+    pattern = paste0("^", gsub("\\.", "\\\\.", exact_name), "$"),
+    recursive = TRUE,
+    full.names = TRUE
+  )
+
+  if (length(hits) == 1) {
+    return(hits[1])
+  }
+
+  if (length(hits) > 1) {
+    stop(
+      "Multiple positive-control scored files found for radius ", r, ":\n",
+      paste(hits, collapse = "\n")
+    )
+  }
+
+  warning("Positive scored MOL2 not found for radius ", r)
+  expected_file
+}
+
+find_negative_scored_file <- function(r) {
+
+  exact_name <- paste0(
+    "AQ4_negative_docked_radius", r, "_scored.mol2"
+  )
+
+  hits <- list.files(
+    NEG_SEARCH_ROOT,
+    pattern = paste0("^", gsub("\\.", "\\\\.", exact_name), "$"),
+    recursive = TRUE,
+    full.names = TRUE
+  )
+
+  negative_hits <- hits[
+    grepl("negative", hits, ignore.case = TRUE)
+  ]
+
+  if (length(negative_hits) == 1) {
+    return(negative_hits[1])
+  }
+
+  if (length(negative_hits) > 1) {
+    stop(
+      "Multiple negative-control scored files found for radius ", r, ":\n",
+      paste(negative_hits, collapse = "\n")
+    )
+  }
+
+  if (length(hits) == 1) {
+    return(hits[1])
+  }
+
+  if (length(hits) > 1) {
+    stop(
+      "Multiple possible negative-control scored files found for radius ", r, ":\n",
+      paste(hits, collapse = "\n")
+    )
+  }
+
+  warning("Negative scored MOL2 not found for radius ", r)
+  file.path(
+    NEG_SEARCH_ROOT,
+    paste0("radius", r, "_negative_full"),
+    exact_name
+  )
+}
+
+
+# ============================================================
+# FILE FINDER
+# If the expected radius folder is not found, search recursively
+# under BASE_DIR for the exact scored MOL2 filename.
+# ============================================================
+
+find_scored_file <- function(expected_file, exact_name) {
+
+  if (file.exists(expected_file)) {
+    return(expected_file)
+  }
+
+  hits <- list.files(
+    BASE_DIR,
+    pattern = paste0("^", gsub("\\.", "\\\\.", exact_name), "$"),
+    recursive = TRUE,
+    full.names = TRUE
+  )
+
+  if (length(hits) == 1) {
+    return(hits[1])
+  }
+
+  if (length(hits) > 1) {
+    warning(
+      "Multiple files named ", exact_name,
+      " found. Using first match: ", hits[1]
+    )
+    return(hits[1])
+  }
+
+  expected_file
+}
+
+extract_grid_score <- function(file) {
+  if (!file.exists(file)) {
+    warning("Missing scored MOL2: ", file)
+    return(NA_real_)
+  }
+
+  x <- readLines(file, warn = FALSE)
+  score_line <- grep("Grid[_ ]?Score", x, value = TRUE, ignore.case = TRUE)
+
+  if (length(score_line) == 0) {
+    warning("Grid Score not found in: ", file)
+    return(NA_real_)
+  }
+
+  value <- sub(
+    ".*?(-?[0-9]+(?:\\.[0-9]+)?(?:[eE][-+]?[0-9]+)?)\\s*$",
+    "\\1",
+    score_line[1],
+    perl = TRUE
+  )
+
+  suppressWarnings(as.numeric(value))
+}
+
+read_heavy_atoms <- function(file) {
+  if (!file.exists(file)) stop("Missing MOL2 file: ", file)
+
+  x <- readLines(file, warn = FALSE)
+  atom_start <- which(trimws(x) == "@<TRIPOS>ATOM")
+  if (length(atom_start) == 0) stop("No @<TRIPOS>ATOM section in: ", file)
+
+  start <- atom_start[1] + 1
+  next_headers <- which(grepl("^@<TRIPOS>", x) & seq_along(x) > atom_start[1])
+  end <- if (length(next_headers) > 0) next_headers[1] - 1 else length(x)
+
+  atom_lines <- x[start:end]
+  atom_lines <- atom_lines[nzchar(trimws(atom_lines))]
+
+  parsed <- lapply(atom_lines, function(line) {
+    p <- strsplit(trimws(line), "\\s+")[[1]]
+    if (length(p) < 6) return(NULL)
+
+    atom_name <- p[2]
+    atom_type <- p[6]
+    element <- toupper(strsplit(atom_type, "\\.")[[1]][1])
+    if (element == "H") return(NULL)
+
+    xyz <- suppressWarnings(as.numeric(p[3:5]))
+    if (any(is.na(xyz))) return(NULL)
+
+    data.frame(
+      AtomName = atom_name,
+      X = xyz[1],
+      Y = xyz[2],
+      Z = xyz[3],
+      stringsAsFactors = FALSE
+    )
+  })
+
+  parsed <- Filter(Negate(is.null), parsed)
+  if (length(parsed) == 0) stop("No heavy atoms read from: ", file)
+
+  bind_rows(parsed)
+}
+
+calculate_metrics <- function(reference_file, docked_file) {
+  if (!file.exists(docked_file)) {
+    warning("Missing docked MOL2: ", docked_file)
+    return(c(HeavyAtomRMSD = NA_real_, CentroidDistance = NA_real_))
+  }
+
+  ref <- read_heavy_atoms(reference_file)
+  dock <- read_heavy_atoms(docked_file)
+
+  matched <- inner_join(ref, dock, by = "AtomName", suffix = c("_ref", "_dock"))
+
+  if (nrow(matched) == 0) {
+    warning("No common heavy-atom names between reference and: ", docked_file)
+    return(c(HeavyAtomRMSD = NA_real_, CentroidDistance = NA_real_))
+  }
+
+  diff_sq <- (matched$X_ref - matched$X_dock)^2 +
+             (matched$Y_ref - matched$Y_dock)^2 +
+             (matched$Z_ref - matched$Z_dock)^2
+
+  rmsd <- sqrt(mean(diff_sq))
+
+  ref_centroid <- c(mean(matched$X_ref), mean(matched$Y_ref), mean(matched$Z_ref))
+  dock_centroid <- c(mean(matched$X_dock), mean(matched$Y_dock), mean(matched$Z_dock))
+  centroid_distance <- sqrt(sum((ref_centroid - dock_centroid)^2))
+
+  c(HeavyAtomRMSD = rmsd, CentroidDistance = centroid_distance)
+}
+
+positive_reference <- AQ4_REFERENCE
+positive_data <- lapply(positive_radii, function(r) {
+  scored_file <- find_positive_scored_file(r)
+
+  metrics <- calculate_metrics(positive_reference, scored_file)
+
+  data.frame(
+    SphereRadius = r,
+    Margin = r + 6,
+    GridScore = extract_grid_score(scored_file),
+    HeavyAtomRMSD = unname(metrics["HeavyAtomRMSD"]),
+    CentroidDistance = unname(metrics["CentroidDistance"])
+  )
+}) |> bind_rows()
+
+positive_data$RadiusFactor <- factor(positive_data$SphereRadius, levels = positive_radii)
+
+# The same prepared AQ4 reference is used for both controls.
+negative_reference <- AQ4_REFERENCE
+negative_data <- lapply(negative_radii, function(r) {
+  scored_file <- find_negative_scored_file(r)
+
+  metrics <- calculate_metrics(negative_reference, scored_file)
+
+  data.frame(
+    SphereRadius = r,
+    Margin = r + 6,
+    GridScore = extract_grid_score(scored_file),
+    HeavyAtomRMSD = unname(metrics["HeavyAtomRMSD"]),
+    CentroidDistance = unname(metrics["CentroidDistance"])
+  )
+}) |> bind_rows()
+
+negative_data$RadiusFactor <- factor(negative_data$SphereRadius, levels = negative_radii)
+
+cat("\nPOSITIVE CONTROL DATA\n")
+print(positive_data)
+cat("\nNEGATIVE CONTROL DATA\n")
+print(negative_data)
+
+write.csv(positive_data, "1M17_positive_control_automated_metrics.csv", row.names = FALSE)
+write.csv(negative_data, "1M17_negative_control_automated_metrics.csv", row.names = FALSE)
+
+positive_colours <- c(
+  "4"="#1F77B4","6"="#FF7F0E","8"="#2CA02C","10"="#D62728",
+  "12"="#9467BD","14"="#8C564B","16"="#E377C2","18"="#7F7F7F",
+  "20"="#17BECF","22"="#393B79","24"="#637939","26"="#8C6D31",
+  "28"="#843C39"
+)
+negative_colours <- positive_colours[names(positive_colours) %in% as.character(negative_radii)]
+
+journal_theme <- theme_classic(base_size = 10) +
+  theme(
+    axis.line = element_line(colour = "black", linewidth = 0.5),
+    axis.ticks = element_line(colour = "black", linewidth = 0.4),
+    axis.title = element_text(face = "bold", size = 10),
+    axis.text = element_text(colour = "black", size = 8),
+    plot.title = element_text(face = "bold", size = 10.5, hjust = 0.5, margin = margin(b = 7)),
+    plot.tag = element_text(face = "bold", size = 13),
+    plot.margin = margin(8, 8, 8, 8)
+  )
+
+A <- ggplot(positive_data, aes(x = RadiusFactor, y = CentroidDistance, group = RadiusFactor)) +
+  geom_boxplot(width = 0.48, fill = "white", colour = "grey35", linewidth = 0.6, outlier.shape = NA, na.rm = TRUE) +
+  geom_point(aes(colour = RadiusFactor), size = 2.8, show.legend = FALSE, na.rm = TRUE) +
+  scale_colour_manual(values = positive_colours) +
+  scale_y_continuous(limits = c(0, 12), breaks = seq(0, 12, 2), expand = expansion(mult = c(0.02, 0.04))) +
+  labs(tag = "A", title = "Docking distance by sphere selection radius", x = "Sphere selection radius (Å)", y = "Docking distance (Å)") +
+  journal_theme
+
+B <- ggplot(negative_data, aes(x = RadiusFactor, y = CentroidDistance, group = RadiusFactor)) +
+  geom_boxplot(width = 0.48, fill = "white", colour = "grey35", linewidth = 0.6, outlier.shape = NA) +
+  geom_point(aes(colour = RadiusFactor), size = 2.8, show.legend = FALSE) +
+  scale_colour_manual(values = negative_colours) +
+  scale_y_continuous(limits = c(0, 38), breaks = seq(0, 35, 5), expand = expansion(mult = c(0.02, 0.04))) +
+  labs(tag = "B", title = "Docking distance by sphere selection radius", x = "Sphere selection radius (Å)", y = "Docking distance (Å)") +
+  journal_theme
+
+C <- ggplot(positive_data, aes(x = RadiusFactor, y = GridScore, group = RadiusFactor)) +
+  geom_boxplot(width = 0.48, fill = "white", colour = "grey35", linewidth = 0.6, outlier.shape = NA) +
+  geom_point(aes(colour = RadiusFactor), size = 2.8, show.legend = FALSE) +
+  scale_colour_manual(values = positive_colours) +
+  scale_y_continuous(limits = c(-56, -42), breaks = seq(-56, -42, 2), expand = expansion(mult = c(0.04, 0.04))) +
+  labs(tag = "C", title = "Docking score by sphere selection radius", x = "Sphere selection radius (Å)", y = "Grid score (kcal/mol)") +
+  journal_theme
+
+D <- ggplot(negative_data, aes(x = RadiusFactor, y = GridScore, group = RadiusFactor)) +
+  geom_boxplot(width = 0.48, fill = "white", colour = "grey35", linewidth = 0.6, outlier.shape = NA) +
+  geom_point(aes(colour = RadiusFactor), size = 2.8, show.legend = FALSE) +
+  scale_colour_manual(values = negative_colours) +
+  scale_y_continuous(limits = c(-60, -28), breaks = seq(-60, -28, 4), expand = expansion(mult = c(0.04, 0.04))) +
+  labs(tag = "D", title = "Docking score by sphere selection radius", x = "Sphere selection radius (Å)", y = "Grid score (kcal/mol)") +
+  journal_theme
+
+E <- ggplot(positive_data, aes(x = CentroidDistance, y = GridScore, colour = RadiusFactor)) +
+  geom_point(size = 3, na.rm = TRUE) +
+  geom_text(aes(label = SphereRadius), colour = "black", nudge_x = 0.16, nudge_y = 0.18, size = 2.6, check_overlap = FALSE, show.legend = FALSE, na.rm = TRUE) +
+  scale_colour_manual(values = positive_colours, name = "Sphere radius (Å)", guide = guide_legend(nrow = 2, byrow = TRUE)) +
+  scale_x_continuous(limits = c(0, 12), breaks = seq(0, 12, 2), expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(limits = c(-56, -42), breaks = seq(-56, -42, 2), expand = expansion(mult = c(0.04, 0.04))) +
+  labs(tag = "E", title = "Docking score versus docking distance", x = "Docking distance (Å)", y = "Grid score (kcal/mol)") +
+  journal_theme
+
+F <- ggplot(negative_data, aes(x = CentroidDistance, y = GridScore, colour = RadiusFactor)) +
+  geom_point(size = 3) +
+  geom_text(aes(label = SphereRadius), colour = "black", nudge_x = 0.35, nudge_y = 0.20, size = 2.6, check_overlap = FALSE, show.legend = FALSE) +
+  scale_colour_manual(values = negative_colours, name = "Sphere radius (Å)", guide = guide_legend(nrow = 2, byrow = TRUE)) +
+  scale_x_continuous(limits = c(0, 38), breaks = seq(0, 35, 5), expand = expansion(mult = c(0.02, 0.04))) +
+  scale_y_continuous(limits = c(-60, -28), breaks = seq(-60, -28, 4), expand = expansion(mult = c(0.04, 0.04))) +
+  labs(tag = "F", title = "Docking score versus docking distance", x = "Docking distance (Å)", y = "Grid score (kcal/mol)") +
+  journal_theme
+
+positive_column <- (A / C / E) +
+  plot_layout(guides = "collect", heights = c(1, 1, 1)) &
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.title = element_text(face = "bold", size = 8),
+    legend.text = element_text(size = 7),
+    legend.key.width = unit(0.35, "cm"),
+    legend.spacing.x = unit(0.08, "cm")
+  )
+
+negative_column <- (B / D / F) +
+  plot_layout(guides = "collect", heights = c(1, 1, 1)) &
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.title = element_text(face = "bold", size = 8),
+    legend.text = element_text(size = 7),
+    legend.key.width = unit(0.35, "cm"),
+    legend.spacing.x = unit(0.08, "cm")
+  )
+
+final_figure <- positive_column | negative_column
+print(final_figure)
+
+ggsave(
+  filename = "1M17_positive_negative_control_ABCDEF_AUTOMATED.pdf",
+  plot = final_figure,
+  width = 11.2,
+  height = 9.2,
+  units = "in",
+  device = cairo_pdf
+)
+
+ggsave(
+  filename = "1M17_positive_negative_control_ABCDEF_AUTOMATED.png",
+  plot = final_figure,
+  width = 11.2,
+  height = 9.2,
+  units = "in",
+  dpi = 600
+)
+
+cat("\nDONE\n")
+cat("Positive metrics: 1M17_positive_control_automated_metrics.csv\n")
+cat("Negative metrics: 1M17_negative_control_automated_metrics.csv\n")
+cat("PDF: 1M17_positive_negative_control_ABCDEF_AUTOMATED.pdf\n")
+cat("PNG: 1M17_positive_negative_control_ABCDEF_AUTOMATED.png\n")
