@@ -13,6 +13,14 @@ library(grid)
 POS_DIR <- "/mnt/data/nidhi/R/3ERT/positive_control_sphere_box"
 NEG_DIR <- "/mnt/data/nidhi/R/3ERT/positive_control_sphere_box/negative_control_sphere_box"
 
+if (!dir.exists(POS_DIR)) {
+  stop("Positive-control directory not found: ", POS_DIR)
+}
+
+if (!dir.exists(NEG_DIR)) {
+  stop("Negative-control directory not found: ", NEG_DIR)
+}
+
 positive_radii <- seq(4, 28, 2)
 negative_radii <- seq(8, 28, 2)  # 4 and 6 had no valid analysed poses
 
@@ -112,9 +120,18 @@ calculate_metrics <- function(reference_file, docked_file) {
 
 positive_reference <- file.path(POS_DIR, "OHT_prepared.mol2")
 positive_data <- lapply(positive_radii, function(r) {
+
+  # 4 Å is stored in radius4_final.
+  # All other positive-control runs use radius<RADIUS>_full.
+  run_folder <- if (r == 4) {
+    "radius4_final"
+  } else {
+    paste0("radius", r, "_full")
+  }
+
   scored_file <- file.path(
     POS_DIR,
-    paste0("radius", r, "_full"),
+    run_folder,
     paste0("OHT_docked_radius", r, "_scored.mol2")
   )
 
@@ -131,7 +148,8 @@ positive_data <- lapply(positive_radii, function(r) {
 
 positive_data$RadiusFactor <- factor(positive_data$SphereRadius, levels = positive_radii)
 
-negative_reference <- file.path(NEG_DIR, "OHT_prepared.mol2")
+# The same prepared OHT reference is used for both controls and is stored in the positive-control folder.
+negative_reference <- file.path(POS_DIR, "OHT_prepared.mol2")
 negative_data <- lapply(negative_radii, function(r) {
   scored_file <- file.path(
     NEG_DIR,
@@ -277,4 +295,3 @@ cat("Positive metrics: 3ERT_positive_control_automated_metrics.csv\n")
 cat("Negative metrics: 3ERT_negative_control_automated_metrics.csv\n")
 cat("PDF: 3ERT_positive_negative_control_ABCDEF_AUTOMATED.pdf\n")
 cat("PNG: 3ERT_positive_negative_control_ABCDEF_AUTOMATED.png\n")
-
